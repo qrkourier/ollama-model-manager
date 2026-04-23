@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +53,12 @@ type HFModel struct {
 	Downloads int    `json:"downloads"`
 }
 
+type pendingModel struct {
+	idx  int
+	size float64
+	name string
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -74,16 +82,14 @@ func main() {
 func printUsage() {
 	fmt.Println("Usage: omm <command>")
 	fmt.Println("\nCommands:")
-	fmt.Println("  pull      Download pending models")
+	fmt.Println("  pull      Download pending models (optimized for speed & concurrency)")
 	fmt.Println("  describe  Display a table of managed models and optimal use cases")
 	fmt.Println("  discover  Evaluate local hardware and discover optimal models from Hugging Face")
 }
 
-// getSystemResources strictly evaluates Linux system resources
 func getSystemResources() SystemResources {
 	res := SystemResources{}
 
-	// 1. Check System RAM (Linux)
 	if memBytes, err := os.ReadFile("/proc/meminfo"); err == nil {
 		lines := strings.Split(string(memBytes), "\n")
 		for _, line := range lines {
@@ -99,7 +105,6 @@ func getSystemResources() SystemResources {
 		}
 	}
 
-	// 2. Check for NVIDIA GPU and VRAM
 	cmd := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits")
 	if out, err := cmd.Output(); err == nil {
 		vramStr := strings.TrimSpace(string(out))
@@ -164,6 +169,16 @@ func saveModels(models []ModelEntry) {
 	os.WriteFile(modelsFile, data, 0644)
 }
 
+func parseSize(p string) float64 {
+	p = strings.ToUpper(strings.TrimSpace(p))
+	p = strings.TrimSuffix(p, "B")
+	v, err := strconv.ParseFloat(p, 64)
+	if err != nil {
+		return 999.0
+	}
+	return v
+}
+
 func pullModels() {
 	models, err := readModels()
 	if err != nil {
@@ -171,31 +186,86 @@ func pullModels() {
 		return
 	}
 
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 2)
+	hasReady := false
+	var pending []pendingModel
 
-	for i := range models {
-		if models[i].Progress >= 100.0 {
-			continue
+	for i, m := range models {
+		if m.Progress >= 100.0 {
+			hasReady = true
+		} else {
+			pending = append(pending, pendingModel{idx: i, size: parseSize(m.Parameters), name: m.Name})
 		}
-
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			fmt.Printf("Starting pull for %s...\n", models[idx].Name)
-			err := pullModel(models[idx].Name, idx, models)
-			if err != nil {
-				fmt.Printf("Failed to pull %s: %v\n", models[idx].Name, err)
-			} else {
-				fmt.Printf("Successfully pulled %s\n", models[idx].Name)
-			}
-		}(i)
 	}
 
-	wg.Wait()
+	if len(pending) == 0 {
+		fmt.Println("All models are already downloaded.")
+		return
+	}
+
+	// Sort pending models by size ascending
+	sort.Slice(pending, func(i, j int) bool {
+		return pending[i].size < pending[j].size
+	})
+
+	// Optimization A: If no models are ready, pull the fastest (smallest) one immediately
+	if !hasReady {
+		first := pending[0]
+		fmt.Printf("\n[Optimization] No models ready. Prioritizing fastest download to unblock usage: %s\n", first.name)
+		err := pullModel(first.name, first.idx, models, true)
+		if err != nil {
+			fmt.Printf("Failed to pull %s: %v\n", first.name, err)
+		}
+		pending = pending[1:]
+	}
+
+	if len(pending) == 0 {
+		return
+	}
+
+	// Optimization B: Group similarly sized models and download concurrently
+	// Largest models naturally fall to the end of the groups list.
+	var groups [][]pendingModel
+	currentGroup := []pendingModel{pending[0]}
+
+	for i := 1; i < len(pending); i++ {
+		// Group models within 3B parameters of each other
+		if math.Abs(pending[i].size-currentGroup[0].size) <= 3.0 {
+			currentGroup = append(currentGroup, pending[i])
+		} else {
+			groups = append(groups, currentGroup)
+			currentGroup = []pendingModel{pending[i]}
+		}
+	}
+	if len(currentGroup) > 0 {
+		groups = append(groups, currentGroup)
+	}
+
+	// Dynamic Parallelism: Adjust concurrency based on group size and observed grouping.
+	for _, group := range groups {
+		fmt.Printf("\n[Optimization] Concurrently pulling %d similarly-sized models (~%.1fB params)\n", len(group), group[0].size)
+
+		var wg sync.WaitGroup
+		// Adjust parallelism based on group constraint (up to 3 to prevent disk IO locking)
+		parallelism := len(group)
+		if parallelism > 3 {
+			parallelism = 3
+		}
+		sem := make(chan struct{}, parallelism)
+
+		for _, pm := range group {
+			wg.Add(1)
+			go func(p pendingModel) {
+				defer wg.Done()
+				sem <- struct{}{}
+				err := pullModel(p.name, p.idx, models, false)
+				if err != nil {
+					fmt.Printf("Failed to pull %s: %v\n", p.name, err)
+				}
+				<-sem
+			}(pm)
+		}
+		wg.Wait()
+	}
 }
 
 func updateProgress(idx int, progress float64, models []ModelEntry) {
@@ -203,7 +273,7 @@ func updateProgress(idx int, progress float64, models []ModelEntry) {
 	saveModels(models)
 }
 
-func pullModel(name string, idx int, models []ModelEntry) error {
+func pullModel(name string, idx int, models []ModelEntry, isSequential bool) error {
 	payload := map[string]string{"name": name}
 	jsonData, _ := json.Marshal(payload)
 
@@ -218,6 +288,7 @@ func pullModel(name string, idx int, models []ModelEntry) error {
 	}
 
 	decoder := json.NewDecoder(resp.Body)
+	lastPrinted := -1
 	for {
 		var pullResp PullResponse
 		if err := decoder.Decode(&pullResp); err == io.EOF {
@@ -229,10 +300,26 @@ func pullModel(name string, idx int, models []ModelEntry) error {
 		if pullResp.Total > 0 {
 			percent := (float64(pullResp.Completed) / float64(pullResp.Total)) * 100
 			updateProgress(idx, percent, models)
-			fmt.Printf("\rPulling %s: %.2f%%\n", name, percent)
+
+			if isSequential {
+				fmt.Printf("\rPulling %s: %.2f%%", name, percent)
+			} else {
+				intPct := int(percent)
+				// Print every 10% to avoid garbling concurrent output
+				if intPct%10 == 0 && intPct != lastPrinted {
+					fmt.Printf("Pulling %s: %d%%\n", name, intPct)
+					lastPrinted = intPct
+				}
+			}
 		}
 	}
+	if isSequential {
+		fmt.Println()
+	}
 	updateProgress(idx, 100.0, models)
+	if !isSequential {
+		fmt.Printf("Successfully pulled %s\n", name)
+	}
 	return nil
 }
 
@@ -266,7 +353,7 @@ func describeModels() {
 func discoverModels() {
 	fmt.Println("Evaluating Linux system resources...")
 	res := getSystemResources()
-	
+
 	fmt.Printf("Hardware Detected:\n")
 	fmt.Printf("  - System RAM: %d MB\n", res.SysRAM_MB)
 	if res.HasNvidia {
@@ -282,7 +369,7 @@ func discoverModels() {
 	fmt.Printf("  - Required Capabilities: %v\n", crit.RequiredCaps)
 
 	fmt.Printf("\nQuerying Hugging Face API for top GGUF coding models...\n")
-	
+
 	hfURL := "https://huggingface.co/api/models?search=gguf+coder&limit=5&sort=downloads"
 	resp, err := http.Get(hfURL)
 	if err != nil {
