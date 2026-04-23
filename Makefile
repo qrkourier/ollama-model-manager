@@ -11,7 +11,7 @@ test:
 	go test -v ./...
 
 install:
-	go install
+	go build -o $(shell go env GOPATH)/bin/omm
 
 clean:
 	rm -f $(BINARY_NAME)
